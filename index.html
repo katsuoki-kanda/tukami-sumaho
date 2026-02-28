@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Hand Tracking Game (Final Optimized)</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+    <style>
+        html, body { 
+            margin: 0; padding: 0; width: 100%; height: 100%; 
+            overflow: hidden; background: #000; font-family: sans-serif; 
+        }
+        #container { position: relative; width: 100vw; height: 100vh; }
+        video { display: none; }
+        
+        /* 映像を全画面表示 */
+        canvas { 
+            width: 100vw; height: 100vh; 
+            object-fit: cover; 
+        }
+        
+        /* スコアとタイマー (前回1.5倍に拡大済み: 33px) */
+        #score, #timer { 
+            position: absolute; top: 40px; color: #0f0; 
+            font-size: 33px; font-weight: bold; pointer-events: none; 
+            text-shadow: 2px 2px 5px #000; z-index: 20; 
+        }
+        #score { left: 20px; }
+        #timer { right: 20px; }
+
+        /* 中央のガイドメッセージを1.5倍に拡大 (20px -> 30px) */
+        #message { 
+            position: absolute; top: 50%; left: 50%; 
+            transform: translate(-50%, -50%); color: #ff0; 
+            font-size: 30px; text-align: center; pointer-events: none; 
+            background: rgba(0,0,0,0.7); padding: 25px; 
+            border-radius: 20px; z-index: 10; width: 85%;
+            box-sizing: border-box;
+            line-height: 1.4;
+        }
+    </style>
+</head>
+<body>
+<div id="container">
+    <video id="input_video" playsinline></video>
+    <canvas id="output_canvas"></canvas>
+    <div id="score">Score: 0</div>
+    <div id="timer">Time: 60</div>
+    <div id="message">カメラ準備中...</div>
+</div>
+
+<script>
+    const videoElement = document.getElementById('input_video');
+    const canvasElement = document.getElementById('output_canvas');
+    const canvasCtx = canvasElement.getContext('2d', { alpha: false });
+    const scoreElement = document.getElementById('score'), 
+          timerElement = document.getElementById('timer'), 
+          messageElement = document.getElementById('message');
+
+    // サイズを2/3に調整した半径
+    const baseRadius = 27;
+    let score = 0, gameStarted = false, startTime = 0, lastEndTime = 0;
+    let circle = { x: 0, y: 0, radius: baseRadius };
+    let isReadyToCatch = false;
+    let handStates = [{ isTouching: false, wasBent: true }, { isTouching: false, wasBent: true }];
+    
+    const cooldownTime = 3000, gameDuration = 60, ringRadius = baseRadius;
+    let audioCtx = null;
+
+    function initAudioContext() {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+    }
+
+    function speak(text) {
+        window.speechSynthesis.cancel();
+        const uttr = new SpeechSynthesisUtterance(text);
+        uttr.lang = 'ja-JP';
+        window.speechSynthesis.speak(uttr);
+    }
+
+    function playCatchSound() {
+        initAudioContext();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.connect(gain); gain.connect(audioCtx.destination);
+        osc.frequency.setValueAtTime(1000, audioCtx.currentTime);
+        osc.start();
+        gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.1);
+        osc.stop(audioCtx.currentTime + 0.12);
+    }
+
+    // 両サイドのはみ出しを完全に防ぐための配置ロジック
+    function generateNewCircle() {
+        // x方向: 中央付近 (0.35〜0.65) に限定することで、object-fit:coverでの欠落を回避
+        circle.x = (Math.random() * 0.3 + 0.35) * canvasElement.width;
+        // y方向: UIと被らない範囲
+        circle.y = (Math.random() * 0.4 + 0.3) * canvasElement.height;
+        handStates.forEach(s => s.isTouching = false); 
+        isReadyToCatch = false;
+    }
+
+    function onResults(results) {
+        if (canvasElement.width !== results.image.width) {
+            canvasElement.width = results.image.width;
+            canvasElement.height = results.image.height;
+        }
+
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+        canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+        
+        let targetCaught = false;
+        let currentFrameReadyToCatch = false;
+        const now = Date.now();
+
+        if (results.multiHandLandmarks) {
+            for (let index = 0; index < Math.min(results.multiHandLandmarks.length, 2); index++) {
+                const landmarks = results.multiHandLandmarks[index];
+                
+                // 軽量描画
+                drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {color: '#00FF00', lineWidth: 2});
+                
+                const hx = landmarks[9].x * canvasElement.width;
+                const hy = landmarks[9].y * canvasElement.height;
+                
+                // 屈曲判定（軽量計算）
+                const dist12 = Math.pow(landmarks[9].x - landmarks[12].x, 2) + Math.pow(landmarks[9].y - landmarks[12].y, 2);
+                const dist09 = Math.pow(landmarks[0].x - landmarks[9].x, 2) + Math.pow(landmarks[0].y - landmarks[9].y, 2);
+                const isBentNow = dist12 < (dist09 * 0.36);
+
+                // 黄色リング
+                canvasCtx.beginPath();
+                canvasCtx.arc(hx, hy, ringRadius, 0, 2 * Math.PI);
+                canvasCtx.strokeStyle = isBentNow ? '#FFF' : '#FF0';
+                canvasCtx.lineWidth = 3;
+                canvasCtx.stroke();
+
+                if (!gameStarted) {
+                    if (now - lastEndTime > cooldownTime && landmarks[9].y < 0.2) {
+                        initAudioContext();
+                        gameStarted = true;
+                        score = 0;
+                        startTime = now;
+                        messageElement.style.display = 'none';
+                        speak("スタート");
+                        generateNewCircle();
+                    }
+                } else {
+                    const distToTarget = Math.hypot(hx - circle.x, hy - circle.y);
+                    const isTouchingNow = distToTarget < (ringRadius + 15);
+                    
+                    if (isTouchingNow && !isBentNow) currentFrameReadyToCatch = true;
+                    if (isTouchingNow && !handStates[index].wasBent && isBentNow) targetCaught = true;
+                    
+                    handStates[index].isTouching = isTouchingNow;
+                    handStates[index].wasBent = isBentNow;
+                }
+            }
+        }
+        
+        isReadyToCatch = currentFrameReadyToCatch;
+
+        if (gameStarted) {
+            if (targetCaught) { 
+                playCatchSound(); 
+                score++; 
+                generateNewCircle(); 
+            }
+            const remaining = Math.max(0, gameDuration - Math.floor((now - startTime) / 1000));
+            timerElement.innerText = `Time: ${remaining}`;
+            scoreElement.innerText = `Score: ${score}`;
+            
+            // ターゲット（緑丸）
+            canvasCtx.fillStyle = isReadyToCatch ? '#FF0000' : '#00EE00';
+            if(isReadyToCatch) {
+                canvasCtx.shadowBlur = 10;
+                canvasCtx.shadowColor = "red";
+            }
+            canvasCtx.beginPath();
+            canvasCtx.arc(circle.x, circle.y, circle.radius, 0, 2 * Math.PI);
+            canvasCtx.fill();
+            canvasCtx.shadowBlur = 0;
+
+            if (remaining <= 0) {
+                gameStarted = false;
+                lastEndTime = now;
+                messageElement.style.display = 'block';
+                messageElement.innerHTML = `終了！<br>${score}点です`;
+                speak(`${score}点です。終了。`);
+            }
+        } else if (now - lastEndTime > cooldownTime) {
+            messageElement.innerHTML = "手を高く上げて<br>開始！";
+        }
+        canvasCtx.restore();
+    }
+
+    const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+    hands.setOptions({
+        maxNumHands: 2,
+        modelComplexity: 0, // ミドルクラススマホ向けの軽量モデル
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5,
+        selfieMode: true
+    });
+    hands.onResults(onResults);
+
+    const camera = new Camera(videoElement, {
+        onFrame: async () => {
+            await hands.send({image: videoElement});
+        },
+        width: 480,
+        height: 640
+    });
+
+    window.onload = () => camera.start();
+    window.addEventListener('touchstart', () => { initAudioContext(); }, { once: true });
+</script>
+</body>
+</html>
